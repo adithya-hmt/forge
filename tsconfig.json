@@ -10,7 +10,9 @@
     "esModuleInterop": true,
     "isolatedModules": true,
     "noEmit": true,
-    "allowImportingTsExtensions": true
+    "allowImportingTsExtensions": true,
+    "types": ["vite/client", "node"]
   },
-  "include": ["src"]
+  "include": ["src", "test", "supabase/functions/_shared", "vitest.config.ts"],
+  "exclude": ["node_modules", "dist", "supabase/functions/github-oauth", "supabase/functions/google-oauth", "supabase/functions/research-worker"]
 }

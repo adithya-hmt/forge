@@ -61,11 +61,114 @@ const OVERRIDE_PATTERNS = [
 ];
 
 export function containsOverrideAttempt(text: string): boolean {
-  return OVERRIDE_PATTERNS.some((re) => re.test(text));
+  return OVERRIDE_PATTERNS.some((re) => re.test(canonicalize(text)));
+}
+
+// ─── Canonicalization (defeats obfuscation before detection) ────────────────
+// Attackers hide overrides in Unicode lookalikes, HTML entities, HTML comments,
+// base64, and nested quotes. canonicalize() folds all of these to plain ASCII-ish
+// text so the tripwire (and any downstream schema extraction) sees the real content.
+
+const UNICODE_LOOKALIKES: Record<string, string> = {
+  "\u0456": "i", "\u0430": "a", "\u0435": "e", "\u043e": "o", "\u0440": "p",
+  "\u0441": "c", "\u0443": "y", "\u0445": "x", "\u2010": "-", "\u2011": "-",
+  "\u2012": "-", "\u2013": "-", "\u2014": "-", "\u2018": "'", "\u2019": "'",
+  "\u201c": '"', "\u201d": '"', "\u00a0": " ", "\u200b": "", "\u200c": "",
+  "\u200d": "", "\ufeff": "",
+};
+
+function decodeHtmlEntities(s: string): string {
+  return s
+    .replace(/&#x([0-9a-f]+);?/gi, (_, h) => safeChr(parseInt(h, 16)))
+    .replace(/&#(\d+);?/g, (_, d) => safeChr(parseInt(d, 10)))
+    .replace(/&lt;/gi, "<").replace(/&gt;/gi, ">").replace(/&quot;/gi, '"')
+    .replace(/&apos;/gi, "'").replace(/&amp;/gi, "&").replace(/&nbsp;/gi, " ");
+}
+function safeChr(code: number): string {
+  return code >= 0x20 && code < 0xfffe ? String.fromCharCode(code) : " ";
+}
+
+/** Fold obfuscated text to inspectable plaintext. Pure + deterministic. */
+export function canonicalize(text: string): string {
+  let s = text;
+  s = s.replace(/<!--[\s\S]*?-->/g, " ");          // HTML comments are not instructions
+  s = s.replace(/<[^>]*>/g, " ");                  // strip tags
+  s = decodeHtmlEntities(s);
+  s = s.normalize("NFKC");                         // fold fullwidth/compat chars
+  s = [...s].map((ch) => UNICODE_LOOKALIKES[ch] ?? ch).join("");
+  // Inline base64 blobs that decode to ASCII text are decoded so their content is
+  // inspected. (Only well-formed, decodable, printable payloads are substituted.)
+  s = s.replace(/\b[A-Za-z0-9+/]{24,}={0,2}\b/g, (blob) => {
+    try {
+      const bin = atob(blob);
+      if (/^[\x20-\x7e]+$/.test(bin)) return bin;
+    } catch { /* not base64 — leave as-is */ }
+    return blob;
+  });
+  return s.toLowerCase();
 }
 
 /** Sanitize a page-derived string before it is displayed or stored as a value.
  *  Strips control chars; rendering itself is React-escaped (never dangerouslySetInnerHTML). */
 export function sanitizeValue(s: string): string {
   return s.replace(/[\u0000-\u001F\u007F]/g, "").trim().slice(0, 500);
+}
+
+// ─── Schema validation for AI-extracted structured output (P12/P13) ─────────
+// When an AI provider extracts claims, its JSON must conform to this schema BEFORE
+// it is trusted. Malformed or out-of-shape output is rejected outright — a model can
+// never smuggle an "action" field or an instruction into the claim set.
+
+export interface ExtractedClaimSchema {
+  deadline?: { value: string; ts: number } | null;
+  prize?: { value: string; num: number | null } | null;
+  eligibility?: string | null;
+  skills?: string[];
+  category?: string;
+}
+
+const ALLOWED_CATEGORIES = new Set([
+  "hackathon", "internship", "fellowship", "grant", "accelerator", "competition", "job",
+]);
+
+/** Validate + coerce AI output. Throws on anything out of contract. */
+export function validateExtractedClaims(input: unknown): ExtractedClaimSchema {
+  if (typeof input !== "object" || input === null || Array.isArray(input))
+    throw new Error("extracted claims must be an object");
+  const o = input as Record<string, unknown>;
+
+  // Reject any field that looks like an instruction or action smuggling attempt.
+  for (const key of Object.keys(o)) {
+    if (/action|instruction|prompt|system|exec|command/i.test(key))
+      throw new Error(`unexpected control field in extracted claims: ${key}`);
+  }
+
+  const out: ExtractedClaimSchema = {};
+  if (o.deadline != null) {
+    const d = o.deadline as Record<string, unknown>;
+    if (typeof d.value === "string" && typeof d.ts === "number" && Number.isFinite(d.ts))
+      out.deadline = { value: sanitizeValue(d.value), ts: d.ts };
+    else if (o.deadline !== null) throw new Error("malformed deadline");
+  }
+  if (o.prize != null) {
+    const p = o.prize as Record<string, unknown>;
+    if (typeof p.value === "string" && (p.num === null || typeof p.num === "number"))
+      out.prize = { value: sanitizeValue(p.value), num: p.num as number | null };
+    else if (o.prize !== null) throw new Error("malformed prize");
+  }
+  if (o.eligibility != null) {
+    if (typeof o.eligibility !== "string") throw new Error("malformed eligibility");
+    out.eligibility = sanitizeValue(o.eligibility);
+  }
+  if (o.skills != null) {
+    if (!Array.isArray(o.skills) || o.skills.some((s) => typeof s !== "string"))
+      throw new Error("malformed skills");
+    out.skills = (o.skills as string[]).map(sanitizeValue).slice(0, 40);
+  }
+  if (o.category != null) {
+    if (typeof o.category !== "string" || !ALLOWED_CATEGORIES.has(o.category))
+      throw new Error(`category not in allowlist: ${String(o.category)}`);
+    out.category = o.category;
+  }
+  return out;
 }

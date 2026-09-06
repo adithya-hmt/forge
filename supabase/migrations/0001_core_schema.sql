@@ -39,13 +39,15 @@ create table public.integrations (
 create trigger integrations_updated before update on public.integrations
   for each row execute function public.set_updated_at();
 
--- Tokens are encrypted AT REST via pgp_sym_encrypt (key held server-side as a
--- Supabase secret, never in a client bundle). The client can only ever see ciphertext.
+-- Tokens are encrypted AT REST with AES-256-GCM INSIDE the Edge Function, using the
+-- OAUTH_ENCRYPTION_KEY function secret (see supabase/functions/_shared/token-crypto.ts).
+-- The stored value is a base64 text blob (version||nonce||ciphertext) — NOT bytea and
+-- NOT Supabase Vault. Only service_role can read this table; the browser never does.
 create table public.oauth_credentials (
   user_id uuid not null references auth.users(id) on delete cascade,
   provider text not null,
-  access_token_enc bytea not null,
-  refresh_token_enc bytea,
+  access_token_enc text not null,          -- JSON StoredSecret {data,alg,v}, base64 payload
+  refresh_token_enc text,                  -- JSON StoredSecret or null
   expires_at timestamptz,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
@@ -72,11 +74,18 @@ create table public.research_jobs (
   idempotency_key text not null,
   goal text not null,
   mode text not null default 'live',
-  state text not null default 'queued',   -- queued | leased | done | failed
+  state text not null default 'queued',   -- queued | leased | completed | failed
   attempts int not null default 0,
   max_attempts int not null default 3,
+  -- Durable leasing (P10). lease_owner + lease_expires_at let a crashed worker's job
+  -- be reclaimed; next_retry_at spaces retries; seeds are the allowlisted provider URLs.
+  lease_owner text,
+  lease_expires_at timestamptz,
+  next_retry_at timestamptz,
   last_error text,
   cost_usd numeric not null default 0,
+  seeds jsonb not null default '[]'::jsonb,
+  result jsonb,
   result_ids jsonb not null default '[]'::jsonb,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
@@ -84,6 +93,9 @@ create table public.research_jobs (
 );
 create trigger research_jobs_updated before update on public.research_jobs
   for each row execute function public.set_updated_at();
+create index research_jobs_claimable
+  on public.research_jobs (state, next_retry_at)
+  where state in ('queued', 'leased');
 
 create table public.research_job_steps (
   id bigserial primary key,
@@ -183,48 +195,92 @@ create table public.notifications (
   created_at timestamptz not null default now()
 );
 
--- ── RLS: enabled on EVERY user-owned table ──────────────────────────────────
+-- ── RLS: enabled + forced on EVERY user-owned table ────────────────────────
+--
+-- ACCESS MODEL (P6). RLS and PostgreSQL privileges BOTH enforce this:
+--
+--   table                  | anon | authenticated (browser)        | service_role (Edge Fn)
+--   -----------------------+------+--------------------------------+---------------------
+--   profiles               | no   | own rows (RLS)                 | bypass
+--   integrations           | no   | own rows (RLS)                 | bypass
+--   oauth_credentials      | no   | NO ACCESS (RLS, no policy)     | bypass (only writer/reader)
+--   oauth_states           | no   | NO ACCESS (RLS, no policy)     | bypass (only writer/reader)
+--   research_jobs          | no   | own rows (RLS)                 | bypass
+--   research_job_steps     | no   | own rows (RLS)                 | bypass
+--   opportunity_snapshots  | no   | own rows (RLS)                 | bypass
+--   applications           | no   | own rows (RLS)                 | bypass
+--   execution_plans        | no   | own rows (RLS)                 | bypass
+--   calendar_links         | no   | own rows (RLS)                 | bypass
+--   email_links            | no   | own rows (RLS)                 | bypass
+--   learned_adjustments    | no   | own rows (RLS)                 | bypass
+--   evidence_corrections   | no   | own rows (RLS)                 | bypass
+--   notifications          | no   | own rows (RLS)                 | bypass
+--
+-- "NO ACCESS" means RLS is enabled and forced but NO permissive policy exists, so
+-- anon/authenticated always see zero rows. service_role bypasses RLS entirely, which
+-- is exactly how the Edge Functions manage tokens/states.
+
+-- User-facing tables: owner-scoped policy.
 do $$
 declare t text;
 begin
   foreach t in array array[
-    'profiles','integrations','oauth_credentials','oauth_states',
+    'profiles','integrations',
     'research_jobs','research_job_steps','opportunity_snapshots',
     'applications','execution_plans','calendar_links','email_links',
     'learned_adjustments','evidence_corrections','notifications'
   ] loop
     execute format('alter table public.%I enable row level security', t);
     execute format('alter table public.%I force row level security', t);
-    -- one strict policy per table: user may only touch their own rows
     execute format(
       'create policy %I on public.%I for all using (user_id = auth.uid()) with check (user_id = auth.uid())',
       t || '_owner', t);
   end loop;
 end $$;
 
--- ── token encryption helpers (called by Edge Functions via rpc) ─────────────
--- Key lives in Supabase Vault (supabase secrets set OAUTH_ENCRYPTION_KEY=...).
--- SECURITY DEFINER is required because vault is not readable by anon/authenticated.
-create or replace function public.forge_encrypt(plaintext text)
-returns bytea language sql security definer set search_path = public as $$
-  select pgp_sym_encrypt(
-    plaintext,
-    (select decrypted_secret from vault.decrypted_secrets where name = 'OAUTH_ENCRYPTION_KEY' limit 1)
-  );
-$$;
+-- Sensitive tables: RLS on + forced, NO policy → authenticated clients get nothing.
+do $$
+declare t text;
+begin
+  foreach t in array array['oauth_credentials','oauth_states'] loop
+    execute format('alter table public.%I enable row level security', t);
+    execute format('alter table public.%I force row level security', t);
+  end loop;
+end $$;
 
-create or replace function public.forge_decrypt(ciphertext bytea)
-returns text language sql security definer set search_path = public as $$
-  select pgp_sym_decrypt(
-    ciphertext,
-    (select decrypted_secret from vault.decrypted_secrets where name = 'OAUTH_ENCRYPTION_KEY' limit 1)
-  );
-$$;
--- Only the service role invokes these; never grant to anon.
-revoke all on function public.forge_encrypt(text) from public, anon, authenticated;
-revoke all on function public.forge_decrypt(bytea) from public, anon, authenticated;
-grant execute on function public.forge_encrypt(text) to service_role;
-grant execute on function public.forge_decrypt(bytea) to service_role;
+-- ── Least-privilege grants (P6) ─────────────────────────────────────────────
+-- Modern Supabase does not auto-expose new public tables. Grant only what the
+-- authenticated browser client needs; deny the sensitive tables outright.
+
+-- Revoke any blanket defaults, then grant per-table.
+revoke all on all tables in schema public from anon, authenticated;
+
+grant select, insert, update, delete on public.profiles            to authenticated;
+grant select, insert, update, delete on public.integrations        to authenticated;
+grant select, insert, update, delete on public.research_jobs       to authenticated;
+grant select, insert                 on public.research_job_steps  to authenticated;
+grant select, insert, update, delete on public.opportunity_snapshots to authenticated;
+grant select, insert, update, delete on public.applications        to authenticated;
+grant select, insert, update, delete on public.execution_plans     to authenticated;
+grant select, insert, update, delete on public.calendar_links      to authenticated;
+grant select, insert, update, delete on public.email_links         to authenticated;
+grant select, insert, update, delete on public.learned_adjustments to authenticated;
+grant select, insert, update, delete on public.evidence_corrections to authenticated;
+grant select, insert, update, delete on public.notifications       to authenticated;
+
+-- Explicitly ensure the token/state tables are NOT granted to anon/authenticated.
+revoke all on public.oauth_credentials from anon, authenticated;
+revoke all on public.oauth_states      from anon, authenticated;
+
+-- Sequences needed for inserts on serial-PK tables.
+grant usage on sequence public.research_job_steps_id_seq to authenticated;
+grant usage on sequence public.email_links_id_seq        to authenticated;
+grant usage on sequence public.notifications_id_seq      to authenticated;
+
+-- ── NOTE on token encryption (P4) ──────────────────────────────────────────
+-- There are NO SQL encryption helpers and NO Supabase Vault usage. AES-256-GCM is
+-- performed inside the Edge Functions (supabase/functions/_shared/token-crypto.ts)
+-- with the OAUTH_ENCRYPTION_KEY function secret. Exactly one secret store.
 
 create index research_jobs_user_state on public.research_jobs (user_id, state);
 create index snapshots_user_status on public.opportunity_snapshots (user_id, status);

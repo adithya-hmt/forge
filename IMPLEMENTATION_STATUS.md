@@ -1,39 +1,62 @@
-# Forge — Implementation Status Ledger
+# Forge — Implementation Status
 
-> Living document. Classification rules:
-> **VERIFIED WORKING** = executed successfully with observable evidence in this environment.
-> **IMPLEMENTED, NOT RUNTIME VERIFIED** = complete code exists; execution blocked by missing credentials/environment (marked `BLOCKED BY …`).
-> **PARTIALLY IMPLEMENTED** = real logic exists but with material gaps.
-> **STUB** = interface/UI exists, no real behavior behind it.
-> **NOT IMPLEMENTED** = absent.
->
-> This ledger was written **before** the repair pass (section A) and re-audited **after** it (section B).
+**This document is the source of truth.** It is written BEFORE the repair pass and
+updated again at the end. Statuses mean exactly:
+
+- **VERIFIED_WORKING** — code exists AND was executed successfully (command + test listed).
+- **IMPLEMENTED_NOT_RUNTIME_VERIFIED** — code + automated tests exist, but the real
+  external dependency (provider / live database) was not exercised in this environment.
+- **PARTIALLY_IMPLEMENTED** — some paths work, others do not.
+- **NOT_IMPLEMENTED** — absent.
+- **BLOCKED_BY_CREDENTIALS** — cannot be runtime-verified without a secret that is not
+  present in this environment.
+
+Never read "code exists" as "verified".
 
 ---
 
-## A. Pre-repair state (hostile audit baseline)
+## Status Table (initial — before repair pass)
 
-| Capability | Status | Evidence (file → function) |
+| Feature | Status | Implementation files | Tests | Runtime verification performed | Remaining blocker |
+|---|---|---|---|---|---|
+| Frontend build | PARTIALLY_IMPLEMENTED | `src/**`, `vite.config.ts` | none | `npm run build` previously exit 0 | no lint/test scripts wired |
+| Supabase authentication | IMPLEMENTED_NOT_RUNTIME_VERIFIED | `src/lib/supabase.ts`, `store.tsx` | none | not run | no Supabase project in env |
+| Supabase persistence | PARTIALLY_IMPLEMENTED | `src/lib/persistence.ts` | none | not run | error handling discards failures; rehydration incomplete |
+| RLS | IMPLEMENTED_NOT_RUNTIME_VERIFIED | `supabase/migrations/0001_core_schema.sql` | none | not run | no two-user security test; no explicit grants |
+| GitHub OAuth | PARTIALLY_IMPLEMENTED | `supabase/functions/github-oauth/index.ts`, `src/lib/oauth.ts` | none | not run | callback lacks JWT context; state not returned to client; open redirect; Vault/secret mismatch |
+| GitHub repository sync | NOT_IMPLEMENTED | — | — | — | authenticated sync not wired to Evidence Graph |
+| Google OAuth | PARTIALLY_IMPLEMENTED | `supabase/functions/google-oauth/index.ts` | none | not run | same callback/state/redirect/encryption issues |
+| Google token refresh | IMPLEMENTED_NOT_RUNTIME_VERIFIED | `google-oauth/index.ts` `getValidToken` | none | not run | needs live Google creds |
+| Google Calendar | IMPLEMENTED_NOT_RUNTIME_VERIFIED | `google-oauth/index.ts` `calendar_create` | none | not run | weak payload validation; no compensation on partial failure |
+| Gmail reading | IMPLEMENTED_NOT_RUNTIME_VERIFIED | `google-oauth/index.ts` `gmail_list/get` | none | not run | needs live Google creds |
+| Gmail draft creation | PARTIALLY_IMPLEMENTED | `google-oauth/index.ts` `gmail_draft` | none | not run | MIME built by string interpolation (header-injection risk) |
+| Research pipeline | PARTIALLY_IMPLEMENTED | `src/lib/engine.ts`, `src/lib/adapters.ts`, `store.tsx` | `test/engine.test.ts` | unit tests only | browser-only fetch; no SSRF guard; jobs in-memory |
+| Deduplication | VERIFIED_WORKING | `src/lib/engine.ts` `dedupeKeyGroups` | `test/engine.test.ts` | vitest run (prior session) | — |
+| Provenance | VERIFIED_WORKING | `src/lib/engine.ts` `evidenceFor` | `test/engine.test.ts` | vitest run (prior session) | — |
+| Prompt-injection defense | VERIFIED_WORKING | `src/lib/engine.ts`, `src/lib/boundary.ts` | `test/engine.test.ts` | vitest run (prior session) | needs more adversarial cases |
+| Background jobs | PARTIALLY_IMPLEMENTED | `src/lib/jobqueue.ts` | none | not run | in-memory only — NOT durable |
+| AI provider | IMPLEMENTED_NOT_RUNTIME_VERIFIED | `src/lib/ai.ts` | none | not run | not integrated into any production flow; no server proxy |
+| Persistence rehydration | PARTIALLY_IMPLEMENTED | `src/lib/persistence.ts` `load()` | none | not run | stores more than it reloads |
+| Automated tests | PARTIALLY_IMPLEMENTED | `test/*.test.ts` | vitest | engine tests only | no lint/unit/integration/security split; no scripts |
+| CI | NOT_IMPLEMENTED | — | — | — | no workflow |
+| Deployment configuration | NOT_IMPLEMENTED | — | — | — | no config.toml, no README, no .env.example |
+| Next.js App Router | NOT_IMPLEMENTED | — | — | — | app is Vite SPA (see P22 — deferred by choice) |
+
+---
+
+## Credential / environment inventory
+
+| Variable | Safe for browser? | Present in env? |
 |---|---|---|
-| Deterministic extraction pipeline (state machine) | VERIFIED WORKING | `src/lib/store.tsx → runResearch`, `src/lib/engine.ts → extractClaims, mergeGroup` |
-| Provenance on synthetic corpus | PARTIALLY IMPLEMENTED | `src/lib/engine.ts → evidenceFor` — hash covered whole doc, not excerpt; per-claim confidence was a provider constant |
-| Deduplication | PARTIALLY IMPLEMENTED | `src/lib/engine.ts → dedupeKeyGroups` — lexical title Jaccard only; no canonical-URL/org/deadline signals |
-| Prompt-injection isolation | PARTIALLY IMPLEMENTED | `src/lib/engine.ts → detectInjection` — regex tripwire only; no typed trust boundary |
-| GitHub public repo analysis | VERIFIED WORKING | `src/lib/github.ts → analyzeGitHub` — live `api.github.com` calls (only real `fetch()` in repo) |
-| GitHub **OAuth** | NOT IMPLEMENTED | zero auth code; `src/lib/github.ts:4-5` comment admits it |
-| Google OAuth / Calendar / Gmail | STUB | `src/lib/store.tsx → syncCalendar` fabricates `gcal_${fnv1a(b.id)}` IDs; no transport |
-| Supabase persistence | NOT IMPLEMENTED | `@supabase/supabase-js` installed, never imported; only storage call: `sessionStorage` theme (`store.tsx:497`) |
-| RLS / two-user isolation | NOT IMPLEMENTED | no database, no migrations, no SQL anywhere |
-| Live web research | NOT IMPLEMENTED | `src/lib/engine.ts → fetchDoc` is `sleep()` over in-memory corpus (`src/lib/corpus.ts`) |
-| Background jobs | PARTIALLY IMPLEMENTED | ad-hoc async fn in `store.tsx`; no job IDs/states/attempts/leases; recrawl-vs-research race |
-| AI provider abstraction | NOT IMPLEMENTED | zero model calls; drafts/plans are templates (`src/lib/scoring.ts`) |
-| Test infrastructure | NOT IMPLEMENTED | no `*.test.*` files, no runner; in-app `src/lib/evals.ts → runEvals` only runs via browser button |
-| Lint / CI | NOT IMPLEMENTED | no eslint config, no workflow |
-| Production build | VERIFIED WORKING | `npm run build` → exit 0 (312 kB bundle) |
-| "Export copy" / "Extract deadline" buttons | STUB | `src/screens/Workspace.tsx:193,257` — toast-only |
+| `VITE_SUPABASE_URL` | yes | NO |
+| `VITE_SUPABASE_ANON_KEY` | yes | NO |
+| `SUPABASE_SERVICE_ROLE_KEY` | NO (server-only) | NO |
+| `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | NO | NO |
+| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | NO | NO |
+| `OAUTH_ENCRYPTION_KEY` | NO (server-only) | NO |
+| `OPENAI_API_KEY` | NO (server-only) | NO |
 
----
-
-## B. Post-repair state
-
-*(updated after the repair pass and final adversarial grep — see end of file)*
+Because no Supabase project and no OAuth credentials exist in this environment,
+**every database- and provider-dependent capability is, at best,
+IMPLEMENTED_NOT_RUNTIME_VERIFIED or BLOCKED_BY_CREDENTIALS.** This is stated plainly
+and will not be upgraded without an actual executed run.

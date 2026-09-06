@@ -2,49 +2,40 @@ import React, { useEffect, useRef, useState } from "react";
 import type { VerifyStatus } from "./lib/types";
 import { daysUntil } from "./lib/scoring";
 
-// ─── Icons (inline SVG, stroke-based) ──────────────────────────────────────
+// ─── Icons — Phosphor (single consistent "regular" weight) ─────────────────
+// P21: general UI iconography comes from @phosphor-icons/react, one weight across
+// the product. Only the Forge brand mark (flame) remains a custom inline SVG.
+import {
+  Lightning, Crosshair, MagnifyingGlass, Graph, Briefcase, TerminalWindow, Gear, Sun,
+  Moon, X, Check, Clock, Link, FileText, Envelope, CalendarBlank, Play, Warning,
+  ShieldCheck, ArrowRight, Plus, Minus, ArrowSquareOut, Lock, ArrowsClockwise,
+  Bell, Eye, GitBranch, Stack, MagicWand,
+} from "@phosphor-icons/react";
+import type { Icon as PhosphorIcon } from "@phosphor-icons/react";
 
-const PATHS: Record<string, React.ReactNode> = {
-  bolt: <path d="M13 2 4.5 13.5H11L9.5 22 19 10h-6.5L13 2Z" />,
-  radar: <><circle cx="12" cy="12" r="9" /><circle cx="12" cy="12" r="4.5" /><path d="M12 12 18.5 5.5" /><circle cx="12" cy="12" r="0.6" fill="currentColor" /></>,
-  search: <><circle cx="10.5" cy="10.5" r="6.5" /><path d="m15.5 15.5 5 5" /></>,
-  graph: <><circle cx="5" cy="6" r="2.4" /><circle cx="19" cy="6" r="2.4" /><circle cx="12" cy="18" r="2.4" /><path d="M7 7.4 10.4 16M17 7.4 13.6 16M7.4 6h9.2" /></>,
-  briefcase: <><rect x="3" y="7" width="18" height="13" rx="1.5" /><path d="M9 7V4.5A1.5 1.5 0 0 1 10.5 3h3A1.5 1.5 0 0 1 15 4.5V7M3 12h18" /></>,
-  terminal: <><rect x="2.5" y="4" width="19" height="16" rx="1.5" /><path d="m6.5 9 3.5 3-3.5 3M12.5 15h5" /></>,
-  gear: <><circle cx="12" cy="12" r="3.2" /><path d="M12 2.8v3M12 18.2v3M2.8 12h3M18.2 12h3M5.2 5.2l2.1 2.1M16.7 16.7l2.1 2.1M18.8 5.2l-2.1 2.1M7.3 16.7l-2.1 2.1" /></>,
-  sun: <><circle cx="12" cy="12" r="4" /><path d="M12 2.5v2.5M12 19v2.5M2.5 12H5M19 12h2.5M4.9 4.9l1.8 1.8M17.3 17.3l1.8 1.8M19.1 4.9l-1.8 1.8M6.7 17.3l-1.8 1.8" /></>,
-  moon: <path d="M20 13.5A8.5 8.5 0 0 1 10.5 4 7.5 7.5 0 1 0 20 13.5Z" />,
-  x: <path d="m6 6 12 12M18 6 6 18" />,
-  check: <path d="m4.5 12.5 5 5L19.5 7" />,
-  clock: <><circle cx="12" cy="12" r="8.5" /><path d="M12 7v5.5l3.5 2" /></>,
-  flame: <path d="M12 2.5S6 8 6 13.5a6 6 0 0 0 12 0c0-2-1-4-2.5-5.5 0 2-1 3-2 3.5.5-2.5-.5-6-1.5-9Z" />,
-  link: <><path d="M9.5 14.5 14.5 9.5" /><path d="M11 6.5 13 4.5a4 4 0 0 1 6 6l-2.5 2.5M13 17.5l-2 2a4 4 0 0 1-6-6l2.5-2.5" /></>,
-  doc: <><path d="M6 3h8l4 4v14H6V3Z" /><path d="M14 3v4h4M9 12h6M9 16h6" /></>,
-  mail: <><rect x="3" y="5.5" width="18" height="13" rx="1.5" /><path d="m3.5 7 8.5 6 8.5-6" /></>,
-  calendar: <><rect x="3.5" y="5" width="17" height="16" rx="1.5" /><path d="M3.5 10h17M8 3v4M16 3v4" /></>,
-  play: <path d="M7 4.5v15l12-7.5L7 4.5Z" />,
-  alert: <><path d="M12 3 1.8 20.5h20.4L12 3Z" /><path d="M12 10v5M12 17.6v.4" /></>,
-  shield: <><path d="M12 2.8 4.5 5.5v6c0 5 3.5 8.2 7.5 9.7 4-1.5 7.5-4.7 7.5-9.7v-6L12 2.8Z" /><path d="m8.8 12 2.2 2.2 4.2-4.4" /></>,
-  arrow: <path d="M4 12h15M13.5 5.5 20 12l-6.5 6.5" />,
-  plus: <path d="M12 5v14M5 12h14" />,
-  minus: <path d="M5 12h14" />,
-  external: <><path d="M14 4h6v6M20 4l-9 9" /><path d="M19 14v6H5V6h6" /></>,
-  lock: <><rect x="5.5" y="11" width="13" height="9.5" rx="1.5" /><path d="M8 11V7.5a4 4 0 0 1 8 0V11" /></>,
-  refresh: <><path d="M4 12a8 8 0 0 1 13.7-5.7L20 8.5M20 12a8 8 0 0 1-13.7 5.7L4 15.5" /><path d="M20 4v4.5h-4.5M4 20v-4.5h4.5" /></>,
-  bell: <><path d="M6 16v-6a6 6 0 0 1 12 0v6l1.5 2.5h-15L6 16Z" /><path d="M10 21a2.2 2.2 0 0 0 4 0" /></>,
-  eye: <><path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12Z" /><circle cx="12" cy="12" r="3" /></>,
-  git: <><circle cx="6" cy="6" r="2.3" /><circle cx="6" cy="18" r="2.3" /><circle cx="18" cy="8" r="2.3" /><path d="M6 8.3v7.4M8.2 7 15.8 7.8" /></>,
-  layers: <><path d="m12 3 9 5-9 5-9-5 9-5Z" /><path d="m3.5 12.5 8.5 4.7 8.5-4.7M3.5 16.5 12 21l8.5-4.5" /></>,
-  wand: <><path d="m5 19 9.5-9.5M17 4l.8 2.2L20 7l-2.2.8L17 10l-.8-2.2L14 7l2.2-.8L17 4Z" /><path d="M7 4.5 7.6 6 9 6.5 7.6 7 7 8.5 6.4 7 5 6.5 6.4 6 7 4.5ZM19 14l.6 1.4L21 16l-1.4.6L19 18l-.6-1.4L17 16l1.4-.6L19 14Z" /></>,
+const PHOSPHOR: Record<string, PhosphorIcon> = {
+  bolt: Lightning, radar: Crosshair, search: MagnifyingGlass, graph: Graph,
+  briefcase: Briefcase, terminal: TerminalWindow, gear: Gear, sun: Sun, moon: Moon,
+  x: X, check: Check, clock: Clock, link: Link, doc: FileText, mail: Envelope,
+  calendar: CalendarBlank, play: Play, alert: Warning, shield: ShieldCheck,
+  arrow: ArrowRight, plus: Plus, minus: Minus, external: ArrowSquareOut, lock: Lock,
+  refresh: ArrowsClockwise, bell: Bell, eye: Eye, git: GitBranch, layers: Stack,
+  wand: MagicWand,
 };
 
-export function Icon({ name, size = 15, className = "" }: { name: keyof typeof PATHS | string; size?: number; className?: string }) {
-  return (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7"
-      strokeLinecap="round" strokeLinejoin="round" className={`shrink-0 ${className}`} aria-hidden>
-      {PATHS[name] ?? <circle cx="12" cy="12" r="8" />}
-    </svg>
-  );
+export function Icon({ name, size = 15, className = "" }: { name: string; size?: number; className?: string }) {
+  // Brand mark stays custom SVG (the one genuine Forge asset).
+  if (name === "flame") {
+    return (
+      <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7"
+        strokeLinecap="round" strokeLinejoin="round" className={`shrink-0 ${className}`} aria-hidden>
+        <path d="M12 2.5S6 8 6 13.5a6 6 0 0 0 12 0c0-2-1-4-2.5-5.5 0 2-1 3-2 3.5.5-2.5-.5-6-1.5-9Z" />
+      </svg>
+    );
+  }
+  const P = PHOSPHOR[name];
+  if (!P) return <svg width={size} height={size} viewBox="0 0 24 24" className={`shrink-0 ${className}`} aria-hidden><circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" strokeWidth="1.7" /></svg>;
+  return <P size={size} weight="regular" className={`shrink-0 ${className}`} aria-hidden />;
 }
 
 // ─── Panel with corner ticks ────────────────────────────────────────────────

@@ -1,15 +1,22 @@
 // Forge — Google OAuth Edge Function (Deno, Supabase). Calendar + Gmail.
-// Flow: authorize (state + PKCE generated SERVER-side) → callback → exchange →
-// encrypted storage → refresh-on-expiry → revocation.
+//
+// Route authorization model (supabase/config.toml — verify_jwt=false at gateway):
+//   prepare  : requires Supabase bearer JWT; creates one-time state + server PKCE verifier
+//   proxy    : requires Supabase bearer JWT; Calendar/Gmail via stored token
+//   callback : provider redirect; validates state, atomically marks used, exchanges code
 //
 // HARD SAFETY RULES (structural, not config):
-//   · Gmail: this function exposes messages.list / messages.get / drafts.create ONLY.
-//     users.messages.send is never called anywhere in this file — Forge cannot send email.
-//   · Calendar: events.insert is only reachable after the client has recorded the user's
-//     explicit confirmation, and duplicates are rejected via calendar_links before insert.
+//   · Gmail: only messages.list / messages.get / drafts.create are reachable.
+//     users.messages.send is never called — Forge cannot send email.
+//   · Calendar: events.insert only after client sends confirmed===true (explicit user
+//     confirmation), with server-side payload validation and a duplicate guard.
 //
-// Secrets: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, OAUTH_ENCRYPTION_KEY, APP_ORIGIN
+// Token storage (P4/P5): AES-256-GCM via OAUTH_ENCRYPTION_KEY, base64 text blob.
 import { createClient } from "npm:@supabase/supabase-js@2";
+import { encryptToken, decryptToken, type StoredSecret } from "../_shared/token-crypto.ts";
+import { isAllowedRedirect } from "../_shared/redirect.ts";
+import { validateState, type StateRow } from "../_shared/oauth-state.ts";
+import { buildMime, mimeToRaw } from "../_shared/mime.ts";
 
 const SCOPES = "https://www.googleapis.com/auth/calendar https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.compose";
 const cors = {
@@ -20,45 +27,37 @@ const cors = {
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { ...cors, "Content-Type": "application/json" } });
 
-const sb = () => createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
+const serviceClient = () =>
+  createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
+const key = () => Deno.env.get("OAUTH_ENCRYPTION_KEY") ?? "";
+const redirectUri = () => `${Deno.env.get("SUPABASE_URL")}/functions/v1/google-oauth?op=callback`;
 
 const b64url = (buf: ArrayBuffer) =>
   btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 
 async function requireUser(req: Request) {
   const jwt = (req.headers.get("Authorization") ?? "").replace("Bearer ", "");
-  const { data, error } = await sb().auth.getUser(jwt);
-  if (error || !data.user) throw new Response("unauthorized", { status: 401, headers: cors });
+  if (!jwt) throw Object.assign(new Error("missing bearer token"), { status: 401 });
+  const { data, error } = await serviceClient().auth.getUser(jwt);
+  if (error || !data.user) throw Object.assign(new Error("invalid or expired session"), { status: 401 });
   return data.user;
 }
-async function encryptToken(plain: string) {
-  const { data, error } = await sb().rpc("forge_encrypt", { plaintext: plain });
-  if (error) throw new Error(error.message);
-  return Array.from(Uint8Array.from(data as number[]));
-}
-async function decryptToken(cipher: number[]) {
-  const { data, error } = await sb().rpc("forge_decrypt", { ciphertext: cipher });
-  if (error) throw new Error(error.message);
-  return data as string;
-}
 
-const redirectUri = () => `${Deno.env.get("SUPABASE_URL")}/functions/v1/google-oauth?op=callback`;
-
-// prepare: authenticated (JWT) — creates one-time state + server-held PKCE verifier.
 async function prepare(req: Request) {
-  const body = await req.json().catch(() => ({}));
   const user = await requireUser(req);
-  const state = crypto.randomUUID() + crypto.randomUUID().replace(/-/g, "");
-  const verifier = b64url(crypto.getRandomValues(new Uint8Array(32)).buffer);
-  const redirect = typeof body.redirect === "string" ? body.redirect : Deno.env.get("APP_ORIGIN")!;
-  await sb().from("oauth_states").insert({
+  const body = await req.json().catch(() => ({}));
+  const redirect = isAllowedRedirect(
+    typeof body.redirect === "string" ? body.redirect : null,
+    Deno.env.get("APP_ORIGIN"),
+    Deno.env.get("EXTRA_ORIGINS"),
+    { allowLocalhost: Deno.env.get("ALLOW_LOCALHOST") === "1" },
+  ).url;
+  const state = crypto.randomUUID().replace(/-/g, "") + crypto.randomUUID().replace(/-/g, "");
+  const verifier = b64url(crypto.getRandomValues(new Uint8Array(32)).buffer as ArrayBuffer);
+  const challenge = b64url(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier)));
+  await serviceClient().from("oauth_states").insert({
     state, user_id: user.id, provider: "google", pkce_verifier: verifier, redirect_to: redirect,
   });
-  return json({ url: await startUrl(state, verifier), state });
-}
-
-async function startUrl(state: string, verifier: string): Promise<string> {
-  const challenge = b64url(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier)));
   const target = new URL("https://accounts.google.com/o/oauth2/v2/auth");
   target.searchParams.set("client_id", Deno.env.get("GOOGLE_CLIENT_ID")!);
   target.searchParams.set("redirect_uri", redirectUri());
@@ -69,28 +68,35 @@ async function startUrl(state: string, verifier: string): Promise<string> {
   target.searchParams.set("state", state);
   target.searchParams.set("code_challenge", challenge);
   target.searchParams.set("code_challenge_method", "S256");
-  return target.toString();
-}
-
-// start: plain browser navigation; the unguessable one-time state is the only credential.
-async function start(req: Request) {
-  const state = new URL(req.url).searchParams.get("state");
-  if (!state) return json({ error: "missing state" }, 400);
-  const { data: st } = await sb().from("oauth_states").select("*").eq("state", state).single();
-  if (!st || st.used || st.provider !== "google" || !st.pkce_verifier) return json({ error: "invalid state" }, 403);
-  if (Date.now() - Date.parse(st.created_at) > 10 * 60_000) return json({ error: "state expired" }, 403);
-  return new Response(null, { status: 302, headers: { ...cors, Location: await startUrl(state, st.pkce_verifier) } });
+  return json({ url: target.toString(), state });
 }
 
 async function callback(req: Request) {
   const url = new URL(req.url);
-  const state = url.searchParams.get("state");
+  const db = serviceClient();
+  const presented = url.searchParams.get("state");
   const code = url.searchParams.get("code");
-  if (!state || !code) return json({ error: "missing state or code" }, 400);
-  const { data: st } = await sb().from("oauth_states").select("*").eq("state", state).single();
-  if (!st || st.used || st.provider !== "google") return json({ error: "invalid or replayed state" }, 403);
-  if (Date.now() - Date.parse(st.created_at) > 10 * 60_000) return json({ error: "state expired" }, 403);
-  await sb().from("oauth_states").update({ used: true }).eq("state", state);
+
+  const { data: row } = presented
+    ? await db.from("oauth_states").select("*").eq("state", presented).maybeSingle()
+    : { data: null };
+  const verdict = validateState(presented, (row as StateRow | null) ?? null, "google");
+
+  const failRedirect = (reason: string) => {
+    const dest = isAllowedRedirect(null, Deno.env.get("APP_ORIGIN")).url;
+    const target = new URL(dest);
+    target.searchParams.set("oauth", "google");
+    target.searchParams.set("status", "error");
+    target.searchParams.set("reason", reason);
+    return new Response(null, { status: 302, headers: { ...cors, Location: target.toString() } });
+  };
+  if (!verdict.ok) return failRedirect(verdict.reason);
+  if (!code) return failRedirect("missing_code");
+  if (!verdict.row.pkce_verifier) return failRedirect("missing_pkce");
+
+  const { error: useErr } = await db
+    .from("oauth_states").update({ used: true }).eq("state", presented!).eq("used", false);
+  if (useErr) return failRedirect("state_conflict");
 
   const ex = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
@@ -98,38 +104,48 @@ async function callback(req: Request) {
     body: new URLSearchParams({
       client_id: Deno.env.get("GOOGLE_CLIENT_ID")!,
       client_secret: Deno.env.get("GOOGLE_CLIENT_SECRET")!,
-      code, redirect_uri: redirectUri(),
+      code,
+      redirect_uri: redirectUri(),
       grant_type: "authorization_code",
-      code_verifier: st.pkce_verifier ?? "",
+      code_verifier: verdict.row.pkce_verifier,
     }),
   });
   const tok = await ex.json();
-  if (!tok.access_token) return json({ error: "token exchange failed", detail: tok.error_description ?? tok.error }, 502);
+  if (!tok.access_token) return failRedirect("token_exchange_failed");
 
-  await sb().from("oauth_credentials").upsert({
-    user_id: st.user_id, provider: "google",
-    access_token_enc: await encryptToken(tok.access_token),
-    refresh_token_enc: tok.refresh_token ? await encryptToken(tok.refresh_token) : null,
-    expires_at: new Date(Date.now() + (tok.expires_in ?? 3600) * 1000).toISOString(),
-  }, { onConflict: "user_id,provider" });
-  await sb().from("integrations").upsert(
-    { user_id: st.user_id, provider: "google", status: "connected", scope: tok.scope ?? SCOPES },
-    { onConflict: "user_id,provider" });
+  await db.from("oauth_credentials").upsert(
+    {
+      user_id: verdict.row.user_id,
+      provider: "google",
+      access_token_enc: JSON.stringify(await encryptToken(tok.access_token, key())),
+      refresh_token_enc: tok.refresh_token
+        ? JSON.stringify(await encryptToken(tok.refresh_token, key()))
+        : null,
+      expires_at: new Date(Date.now() + (tok.expires_in ?? 3600) * 1000).toISOString(),
+    },
+    { onConflict: "user_id,provider" },
+  );
+  await db.from("integrations").upsert(
+    { user_id: verdict.row.user_id, provider: "google", status: "connected", scope: tok.scope ?? SCOPES },
+    { onConflict: "user_id,provider" },
+  );
 
-  const back = new URL(st.redirect_to);
+  const back = new URL(verdict.row.redirect_to);
   back.searchParams.set("oauth", "google");
   back.searchParams.set("status", "ok");
+  back.searchParams.set("state", presented!);
   return new Response(null, { status: 302, headers: { ...cors, Location: back.toString() } });
 }
 
-/** Returns a live access token, refreshing via refresh_token when expired. */
+/** Live access token, transparently refreshed via refresh_token when expired. */
 async function getValidToken(userId: string): Promise<string> {
-  const db = sb();
+  const db = serviceClient();
   const { data: cred } = await db.from("oauth_credentials").select("*")
-    .eq("user_id", userId).eq("provider", "google").single();
-  if (!cred) throw Object.assign(new Error("google not connected"), { status: 412 });
+    .eq("user_id", userId).eq("provider", "google").maybeSingle();
+  if (!cred?.access_token_enc) throw Object.assign(new Error("google not connected"), { status: 412 });
+
   if (cred.expires_at && Date.parse(cred.expires_at) > Date.now() + 60_000) {
-    return await decryptToken(cred.access_token_enc as number[]);
+    return decryptToken(JSON.parse(cred.access_token_enc) as StoredSecret, key());
   }
   if (!cred.refresh_token_enc) {
     await db.from("integrations").upsert({ user_id: userId, provider: "google", status: "revoked" }, { onConflict: "user_id,provider" });
@@ -141,7 +157,7 @@ async function getValidToken(userId: string): Promise<string> {
     body: new URLSearchParams({
       client_id: Deno.env.get("GOOGLE_CLIENT_ID")!,
       client_secret: Deno.env.get("GOOGLE_CLIENT_SECRET")!,
-      refresh_token: await decryptToken(cred.refresh_token_enc as number[]),
+      refresh_token: await decryptToken(JSON.parse(cred.refresh_token_enc) as StoredSecret, key()),
       grant_type: "refresh_token",
     }),
   });
@@ -151,82 +167,134 @@ async function getValidToken(userId: string): Promise<string> {
     throw Object.assign(new Error("refresh rejected — token revoked by user"), { status: 401 });
   }
   await db.from("oauth_credentials").update({
-    access_token_enc: await encryptToken(tok.access_token),
+    access_token_enc: JSON.stringify(await encryptToken(tok.access_token, key())),
     expires_at: new Date(Date.now() + (tok.expires_in ?? 3600) * 1000).toISOString(),
   }).eq("user_id", userId).eq("provider", "google");
   return tok.access_token;
 }
 
+// ── P15: Calendar event payload validation ──
+function validateEvent(ev: unknown): { summary: string; start: string; end: string; blockId: string; oppId: string } {
+  const e = ev as Record<string, unknown>;
+  const str = (k: string, max: number) => {
+    if (typeof e[k] !== "string" || !e[k] || (e[k] as string).length > max) throw new Error(`invalid ${k}`);
+    return e[k] as string;
+  };
+  const summary = str("summary", 300);
+  const start = str("start", 40);
+  const end = str("end", 40);
+  const blockId = str("blockId", 120);
+  const oppId = str("oppId", 120);
+  const s = Date.parse(start), en = Date.parse(end);
+  if (Number.isNaN(s) || Number.isNaN(en)) throw new Error("invalid timestamps");
+  if (!(s < en)) throw new Error("start must be before end");
+  const now = Date.now();
+  if (s < now - 365 * 86_400_000) throw new Error("event too far in the past");
+  if (s > now + 5 * 365 * 86_400_000) throw new Error("event too far in the future");
+  if (en - s > 24 * 3_600_000) throw new Error("event longer than 24h");
+  return { summary, start, end, blockId, oppId };
+}
+
 async function proxy(req: Request) {
   const user = await requireUser(req);
   const body = await req.json().catch(() => ({}));
+  const db = serviceClient();
   const token = await getValidToken(user.id);
   const g = (url: string, init?: RequestInit) =>
     fetch(url, { ...init, headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", ...(init?.headers ?? {}) } });
 
   switch (body.action) {
-    // ── Calendar ─────────────────────────────────────────────────────────
     case "calendar_create": {
-      // Client must send confirmed=true; it is only set by the explicit confirm modal.
       if (body.confirmed !== true) return json({ error: "missing explicit user confirmation" }, 403);
-      const ev = body.event as { summary: string; start: string; end: string; blockId: string; oppId: string };
-      // Duplicate guard BEFORE any external write: same block or same external event.
-      const { data: dup } = await sb().from("calendar_links")
-        .select("block_id").eq("user_id", user.id).eq("block_id", ev.blockId).maybeSingle();
-      if (dup) return json({ error: "duplicate", existing: dup }, 409);
-      const res = await g("https://www.googleapis.com/calendar/v3/calendars/primary/events", {
-        method: "POST",
-        body: JSON.stringify({ summary: ev.summary, start: { dateTime: ev.start }, end: { dateTime: ev.end } }),
-      });
-      const created = await res.json();
-      if (!created.id) return json({ error: "google rejected event", detail: created }, 502);
-      await sb().from("calendar_links").insert({
-        user_id: user.id, opp_id: ev.oppId, block_id: ev.blockId,
-        external_id: created.id, start_at: ev.start, summary: ev.summary,
-      });
-      return json({ externalId: created.id, htmlLink: created.htmlLink });
+      if (!Array.isArray(body.events) || body.events.length === 0 || body.events.length > 50)
+        return json({ error: "batch must contain 1..50 events" }, 400);
+
+      const results: { blockId: string; externalId?: string; error?: string }[] = [];
+      for (const raw of body.events) {
+        let ev;
+        try {
+          ev = validateEvent(raw);
+        } catch (e) {
+          results.push({ blockId: String((raw as any)?.blockId ?? "?"), error: (e as Error).message });
+          continue;
+        }
+        // Duplicate guard BEFORE any external write: same block already linked?
+        const { data: dup } = await db.from("calendar_links").select("external_id")
+          .eq("user_id", user.id).eq("block_id", ev.blockId).maybeSingle();
+        if (dup) { results.push({ blockId: ev.blockId, externalId: dup.external_id, error: "duplicate" }); continue; }
+
+        const res = await g("https://www.googleapis.com/calendar/v3/calendars/primary/events", {
+          method: "POST",
+          body: JSON.stringify({ summary: ev.summary, start: { dateTime: ev.start }, end: { dateTime: ev.end } }),
+        });
+        const created = await res.json();
+        if (!created.id) { results.push({ blockId: ev.blockId, error: created.error?.message ?? "google rejected event" }); continue; }
+
+        // Persist the link. If THIS fails after Google created the event, we must not
+        // silently diverge: record a compensating row so the reconcile step can heal.
+        const { error: linkErr } = await db.from("calendar_links").insert({
+          user_id: user.id, opp_id: ev.oppId, block_id: ev.blockId,
+          external_id: created.id, start_at: ev.start, summary: ev.summary,
+        });
+        if (linkErr) {
+          await db.from("calendar_links").insert({
+            user_id: user.id, opp_id: ev.oppId, block_id: `${ev.blockId}__orphan`,
+            external_id: created.id, start_at: ev.start, summary: `[orphan:${ev.blockId}] ${ev.summary}`,
+          }).catch(() => undefined);
+          results.push({ blockId: ev.blockId, externalId: created.id, error: "linked_with_orphan_marker" });
+        } else {
+          results.push({ blockId: ev.blockId, externalId: created.id });
+        }
+      }
+      return json({ results });
     }
     case "calendar_delete_link": {
-      await sb().from("calendar_links").delete().eq("user_id", user.id).eq("block_id", body.blockId);
+      const blockId = String(body.blockId ?? "");
+      await db.from("calendar_links").delete().eq("user_id", user.id).eq("block_id", blockId);
       return json({ ok: true });
     }
 
-    // ── Gmail (READ + DRAFT ONLY — there is no send action in this file) ─
     case "gmail_list": {
-      // Query is assembled server-side from an allowlist of organization names.
-      const orgs: string[] = Array.isArray(body.orgs) ? body.orgs.slice(0, 10) : [];
-      const q = orgs.map((o) => `"${String(o).replace(/"/g, "")}"`).join(" OR ") || "newer_than:30d";
+      const orgs: string[] = Array.isArray(body.orgs) ? body.orgs.slice(0, 10).map((o) => String(o).replace(/"/g, "")) : [];
+      const q = orgs.length ? orgs.map((o) => `"${o}"`).join(" OR ") : "newer_than:30d";
       const res = await g(`https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(q)}&maxResults=20`);
       return json(await res.json());
     }
     case "gmail_get": {
-      const res = await g(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${encodeURIComponent(String(body.id))}?format=metadata`);
+      const id = encodeURIComponent(String(body.id ?? ""));
+      const res = await g(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=metadata`);
       return json(await res.json());
     }
     case "gmail_draft": {
-      const raw = btoa(unescape(encodeURIComponent(body.mime as string))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+      // P16: build MIME safely; never interpolate raw strings. Drafts only — no send.
+      let mime: string;
+      try {
+        mime = buildMime({ to: String(body.to ?? ""), subject: String(body.subject ?? ""), body: String(body.body ?? "") });
+      } catch (e) {
+        return json({ error: (e as Error).message }, 400);
+      }
       const res = await g("https://gmail.googleapis.com/gmail/v1/users/me/drafts", {
-        method: "POST", body: JSON.stringify({ message: { raw } }),
+        method: "POST",
+        body: JSON.stringify({ message: { raw: mimeToRaw(mime) } }),
       });
       const draft = await res.json();
-      if (!draft.id) return json({ error: "draft creation failed", detail: draft }, 502);
-      return json({ draftId: draft.id }); // draft stays in the user's Drafts; nothing is sent
+      if (!draft.id) return json({ error: "draft creation failed", detail: draft.error?.message }, 502);
+      return json({ draftId: draft.id });
     }
 
-    // ── Lifecycle ────────────────────────────────────────────────────────
     case "revoke": {
-      const { data: cred } = await sb().from("oauth_credentials").select("*")
-        .eq("user_id", user.id).eq("provider", "google").single();
-      if (cred) {
-        const tok = await decryptToken(cred.access_token_enc as number[]).catch(() => null);
+      const { data: cred } = await db.from("oauth_credentials").select("*")
+        .eq("user_id", user.id).eq("provider", "google").maybeSingle();
+      if (cred?.access_token_enc) {
+        const tok = await decryptToken(JSON.parse(cred.access_token_enc) as StoredSecret, key()).catch(() => null);
         if (tok) await fetch(`https://oauth2.googleapis.com/revoke?token=${encodeURIComponent(tok)}`, { method: "POST" });
-        await sb().from("oauth_credentials").delete().eq("user_id", user.id).eq("provider", "google");
+        await db.from("oauth_credentials").delete().eq("user_id", user.id).eq("provider", "google");
       }
-      await sb().from("integrations").upsert({ user_id: user.id, provider: "google", status: "revoked" }, { onConflict: "user_id,provider" });
+      await db.from("integrations").upsert({ user_id: user.id, provider: "google", status: "revoked" }, { onConflict: "user_id,provider" });
       return json({ ok: true });
     }
     case "status": {
-      const { data } = await sb().from("integrations").select("*").eq("user_id", user.id).eq("provider", "google").maybeSingle();
+      const { data } = await db.from("integrations").select("*").eq("user_id", user.id).eq("provider", "google").maybeSingle();
       return json({ status: data?.status ?? "disconnected" });
     }
     default:
@@ -240,7 +308,6 @@ Deno.serve(async (req) => {
     const op = new URL(req.url).searchParams.get("op");
     if (op === "callback") return await callback(req);
     if (op === "prepare") return await prepare(req);
-    if (op === "start") return await start(req);
     return await proxy(req);
   } catch (e) {
     if (e instanceof Response) return e;
