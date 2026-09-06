@@ -11,9 +11,7 @@ const workspace = fs.readFileSync("src/screens/Workspace.tsx", "utf8");
 
 describe("Forge UI redesign contracts", () => {
   it("defines quiet workspace primitives", () => {
-    for (const token of [".surface", ".section-heading", ".toolbar", ".split-shell", ".result-row-selected", ".meta-line"]) {
-      expect(css).toContain(token);
-    }
+    for (const token of [".surface", ".section-heading", ".toolbar", ".split-shell", ".result-row-selected", ".meta-line"]) expect(css).toContain(token);
     expect(ui).toContain("export function Surface");
     expect(ui).toContain("export function Section");
     expect(ui).toContain("export function Toolbar");
@@ -49,12 +47,10 @@ describe("Forge UI redesign contracts", () => {
 
   it("keeps browsing compact and preserves irreversible-action safety", () => {
     expect(search).toContain("Opportunity filters");
-    expect(search).toContain("toolbar");
+    expect(search).toContain("<Toolbar>");
     expect(workspace).toContain("Confirm calendar changes");
     expect(workspace).toContain("Final submission — locked");
   });
 
-  it("includes reduced-motion support", () => {
-    expect(css).toContain("prefers-reduced-motion");
-  });
+  it("includes reduced-motion support", () => expect(css).toContain("prefers-reduced-motion"));
 });
