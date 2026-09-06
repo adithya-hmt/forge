@@ -1,0 +1,28 @@
+name: UI UX Redesign Verification
+
+on:
+  push:
+    branches: [uiux-redesign-work]
+  pull_request:
+    branches: [uiux-redesign]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: UI redesign contract
+        run: npx vitest run test/ui-redesign-contract.test.ts
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Lint
+        run: npm run lint
+      - name: Unit tests
+        run: npm run test:unit
+      - name: Build
+        run: npm run build
