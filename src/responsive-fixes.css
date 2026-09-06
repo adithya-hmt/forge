@@ -1,0 +1,8 @@
+/* Component rules are authored after Tailwind utilities, so `.btn { display: inline-flex }`
+   can otherwise override responsive `md:hidden` on button elements. Keep the
+   responsive utility authoritative without changing the shared button primitive. */
+@media (min-width: 768px) {
+  [class~="md:hidden"].btn {
+    display: none !important;
+  }
+}
