@@ -34,15 +34,16 @@ jobs:
       - name: Render desktop and mobile screenshots
         run: |
           mkdir -p ui-artifacts
-          npm run dev -- --host 127.0.0.1 > /tmp/forge-vite.log 2>&1 &
-          VITE_PID=$!
-          trap 'kill $VITE_PID || true' EXIT
-          for i in {1..30}; do
-            if curl -fsS http://127.0.0.1:5173 >/dev/null; then break; fi
+          python3 -m http.server 4173 --bind 127.0.0.1 --directory dist > /tmp/forge-static.log 2>&1 &
+          SERVER_PID=$!
+          trap 'kill $SERVER_PID || true' EXIT
+          for i in {1..20}; do
+            if curl -fsS http://127.0.0.1:4173 >/dev/null; then break; fi
             sleep 1
           done
-          npx playwright screenshot --browser chromium --viewport-size="1440,1000" --full-page --wait-for-timeout=1200 http://127.0.0.1:5173 ui-artifacts/research-desktop.png
-          npx playwright screenshot --browser chromium --viewport-size="390,844" --full-page --wait-for-timeout=1200 http://127.0.0.1:5173 ui-artifacts/research-mobile.png
+          curl -fsS http://127.0.0.1:4173 >/dev/null
+          npx playwright screenshot --browser chromium --viewport-size="1440,1000" --full-page --wait-for-timeout=1200 http://127.0.0.1:4173 ui-artifacts/research-desktop.png
+          npx playwright screenshot --browser chromium --viewport-size="390,844" --full-page --wait-for-timeout=1200 http://127.0.0.1:4173 ui-artifacts/research-mobile.png
       - uses: actions/upload-artifact@v4
         with:
           name: forge-uiux-render
