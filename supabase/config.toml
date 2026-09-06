@@ -1,0 +1,24 @@
+# Supabase project configuration for Forge.
+#
+# OAuth callback routes are invoked BY THE IDENTITY PROVIDER (GitHub / Google),
+# which redirects the browser with ?code&state but NO Supabase JWT. If the gateway
+# enforced verify_jwt on these functions, the provider callback would 401 before the
+# function could exchange the code. Therefore JWT verification is disabled AT THE
+# GATEWAY for the two OAuth functions.
+#
+# Disabling gateway verification does NOT mean the functions are unauthenticated:
+#   - prepare / proxy / revoke routes manually verify the Supabase bearer JWT
+#     (see requireUser() in each function). An unauthenticated caller cannot reach them.
+#   - callback / start routes rely on a cryptographically random one-time `state`
+#     that is validated, atomically marked used, and expired after 10 minutes.
+#     State is the only credential on those routes; it is unguessable (256+ bits).
+[functions.github-oauth]
+verify_jwt = false
+
+[functions.google-oauth]
+verify_jwt = false
+
+# The research worker is invoked by a server-side scheduler, not the browser.
+# It validates its own caller secret, so gateway JWT checks are also off here.
+[functions.research-worker]
+verify_jwt = false
