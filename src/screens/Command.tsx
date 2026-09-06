@@ -33,7 +33,21 @@ export default function Command() {
     <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_300px] items-start">
       <div className="space-y-4 min-w-0">
         {/* Goal console */}
-        <Panel title="Goal console" right={<span className="chip text-warn border-warn/40">sources: labeled synthetic corpus + live GitHub API</span>}>
+        <Panel title="Goal console" right={
+          <span className="flex items-center gap-1.5">
+            <span className="lbl !text-[8.5px]">sources</span>
+            <button onClick={() => f.setSourceMode("live")}
+              className={`chip cursor-pointer ${f.sourceMode === "live" ? "text-ok border-ok/50" : "hover:text-tx"}`}>live web</button>
+            <button onClick={() => f.setSourceMode("synthetic")}
+              className={`chip cursor-pointer ${f.sourceMode === "synthetic" ? "text-warn border-warn/50" : "hover:text-tx"}`}>synthetic fixtures</button>
+          </span>
+        }>
+          <p className="text-[10.5px] text-tx3 -mt-1 mb-2.5 leading-relaxed">
+            {f.sourceMode === "live"
+              ? "Live mode queries real public APIs — RemoteOK jobs, Devpost hackathons, Hacker News discovery. If a source is unreachable it is reported as an error, never silently replaced."
+              : "Fixture mode runs the labeled offline corpus (scripted drift, conflicting sources, one prompt-injection test page) so the full pipeline is inspectable without network access."}
+            {f.persistenceKind === "session" && <span className="text-warn"> · storage: session-only (Supabase not configured)</span>}
+          </p>
           <div className="relative">
             <textarea
               value={goal} onChange={(e) => setGoal(e.target.value)} rows={2}

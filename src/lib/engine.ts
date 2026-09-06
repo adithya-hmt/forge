@@ -174,9 +174,15 @@ export function extractClaims(doc: SourceDoc): { injected: boolean; claims: RawC
 
 // ─── Fetch simulation (adapter boundary) ───────────────────────────────────
 
-export function providerTrust(p: ProviderId): number {
-  return PROVIDERS.find((x) => x.id === p)?.trust ?? 0.6;
+const LIVE_TRUST: Record<string, number> = { devpost: 0.85, remoteok: 0.7, hn: 0.4, synthetic: 0.75 };
+
+export function providerTrust(p: string): number {
+  if (p in LIVE_TRUST) return LIVE_TRUST[p];
+  return PROVIDERS.find((x) => x.id === p)?.trust ?? 0.5;
 }
+
+/** Primary platforms for their own listings count as authoritative single sources. */
+const AUTHORITATIVE = new Set(["official", "grants", "devpost", "remoteok"]);
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -192,31 +198,89 @@ export async function fetchDoc(doc: SourceDoc, attempt: number): Promise<{ doc: 
 export function evidenceFor(doc: SourceDoc, excerpt: string, confidence: number): EvidenceRef {
   return {
     sourceId: doc.id, url: doc.url, title: doc.title, excerpt,
-    retrievedAt: doc.retrievedAt, contentHash: fnv1a(doc.text),
+    retrievedAt: doc.retrievedAt,
+    // Hash covers the cited claim (url + excerpt), not the whole document, so a
+    // hash can corroborate the specific sentence shown in the provenance modal.
+    contentHash: fnv1a(doc.url + "\u00a7" + excerpt),
     provider: doc.provider, confidence,
   };
 }
 
 // ─── Deduplication ──────────────────────────────────────────────────────────
 
-const STOP = new Set(["the", "for", "and", "with", "via", "2026", "2025", "spring", "summer"]);
+const STOP = new Set(["the", "for", "and", "with", "via", "spring", "summer"]);
 function titleTokens(title: string): string[] {
   return title.toLowerCase().split(/[^a-z0-9]+/).filter((t) => t.length > 2 && !STOP.has(t));
 }
-function jaccard(a: string[], b: string[]): number {
-  const A = new Set(a), B = new Set(b);
+export function titleJaccard(a: string, b: string): number {
+  const A = new Set(titleTokens(a)), B = new Set(titleTokens(b));
   let inter = 0; A.forEach((x) => { if (B.has(x)) inter++; });
   return inter / (A.size + B.size - inter || 1);
 }
 
-export function dedupeKeyGroups(docs: SourceDoc[]): SourceDoc[][] {
-  const groups: SourceDoc[][] = [];
-  for (const d of docs) {
-    const toks = titleTokens(d.title);
-    const hit = groups.find((g) => jaccard(titleTokens(g[0].title), toks) >= 0.3);
-    if (hit) hit.push(d); else groups.push([d]);
+export function canonicalUrl(url: string): string {
+  try {
+    const u = new URL(url);
+    return (u.host + u.pathname).toLowerCase().replace(/\/+$/, "");
+  } catch {
+    return url.toLowerCase();
   }
-  return groups;
+}
+export function normalizeOrg(org: string | undefined): string {
+  return (org ?? "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+export interface DedupeHints {
+  category?: Map<string, string>;        // docId → extracted category
+  deadline?: Map<string, number | null>; // docId → parsed deadline ts
+}
+
+/**
+ * Deterministic multi-signal dedupe (union-find). Merge when ANY rule fires:
+ *   R1  canonical URLs identical (mirror / exact duplicate / updated listing)
+ *   R2  title similarity ≥ 0.75 with compatible deadlines
+ *   R3  same organizer + compatible deadlines + title similarity ≥ 0.35
+ *       (and matching category, when both are known)
+ * Deadlines are "compatible" when either is missing or they are ≤ 14 days apart,
+ * so different yearly editions of an event do NOT merge.
+ */
+export function dedupeKeyGroups(docs: SourceDoc[], hints: DedupeHints = {}): SourceDoc[][] {
+  const parent = docs.map((_, i) => i);
+  const find = (i: number): number => (parent[i] === i ? i : (parent[i] = find(parent[i])));
+  const union = (a: number, b: number) => { parent[find(a)] = find(b); };
+
+  const urls = docs.map((d) => canonicalUrl(d.url));
+  const orgs = docs.map((d) => normalizeOrg(d.org));
+  const dls = docs.map((d) => hints.deadline?.get(d.id) ?? null);
+  const cats = docs.map((d) => hints.category?.get(d.id) ?? null);
+
+  const dlOk = (a: number | null, b: number | null) =>
+    a === null || b === null || Math.abs(a - b) <= 14 * 86_400_000;
+
+  for (let i = 0; i < docs.length; i++) {
+    for (let j = i + 1; j < docs.length; j++) {
+      if (find(i) === find(j)) continue;
+      const sim = titleJaccard(docs[i].title, docs[j].title);
+      if (urls[i] === urls[j]) { union(i, j); continue; }                                // R1
+      if (sim >= 0.75 && dlOk(dls[i], dls[j])) { union(i, j); continue; }                 // R2
+      if (orgs[i] && orgs[i] === orgs[j] && sim >= 0.35 && dlOk(dls[i], dls[j]) &&
+          (cats[i] === null || cats[j] === null || cats[i] === cats[j])) { union(i, j); continue; } // R3
+      // R4: same organizer + same category + effectively identical deadline ⇒
+      // same event even when listing titles were rewritten by the source.
+      if (orgs[i] && orgs[i] === orgs[j] && dls[i] !== null && dls[j] !== null &&
+          Math.abs(dls[i]! - dls[j]!) <= 5 * 86_400_000 &&
+          cats[i] !== null && cats[i] === cats[j]) { union(i, j); }
+    }
+  }
+
+  const byRoot = new Map<number, SourceDoc[]>();
+  docs.forEach((d, i) => {
+    const r = find(i);
+    const arr = byRoot.get(r) ?? [];
+    arr.push(d);
+    byRoot.set(r, arr);
+  });
+  return [...byRoot.values()];
 }
 
 // ─── Verification ───────────────────────────────────────────────────────────
@@ -231,7 +295,7 @@ function resolveField(
   const evs = picks.map((p) => evidenceFor(p.doc, p.excerpt, providerTrust(p.doc.provider)));
   const disagree = picks.some((p) => !agree(picks[0].value, p.value));
   if (!disagree) {
-    const hasAuthority = picks.some((p) => p.doc.provider === "official" || p.doc.provider === "grants");
+    const hasAuthority = picks.some((p) => AUTHORITATIVE.has(p.doc.provider));
     return {
       value: picks[0].value, evidence: evs,
       status: picks.length > 1 || hasAuthority ? "verified" : "unverified",
@@ -288,7 +352,7 @@ export function mergeGroup(group: GroupClaims[], epoch: number, firstSeen: Recor
   if (expired) status = "expired";
 
   const orgMatch = primary.doc.title.match(/—\s*(.+?)(?:\s*\||$)/) || primary.doc.text.match(/Hosted by ([^\n·]+)/i);
-  const org = orgMatch ? orgMatch[1].trim() : primary.doc.title.split("—")[0].split(" ")[0];
+  const org = primary.doc.org ?? (orgMatch ? orgMatch[1].trim() : primary.doc.title.split("—")[0].split(" ")[0]);
 
   return {
     id: `opp-${slug(primary.doc.title).slice(0, 42)}`,

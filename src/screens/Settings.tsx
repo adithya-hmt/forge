@@ -4,6 +4,7 @@ import { Icon, Panel, Meter } from "../ui";
 import { DIM_LABELS, DEFAULT_WEIGHTS } from "../lib/scoring";
 import type { Category, FitDim } from "../lib/types";
 import { SAMPLE_RESUME } from "../lib/corpus";
+import { supabaseConfigured } from "../lib/supabase";
 
 const CATS: Category[] = ["hackathon", "internship", "fellowship", "grant", "accelerator", "competition"];
 
@@ -142,15 +143,55 @@ export default function Settings() {
         })}
       </Panel>
 
+      {/* Account */}
+      <Panel title={f.authUser ? `Account — ${f.authUser.email}` : "Account — Supabase Auth"} right={
+        f.authUser
+          ? <span className="chip text-ok border-ok/40">signed in · RLS active</span>
+          : <span className="chip text-warn border-warn/40">{supabaseConfigured ? "not signed in" : "not configured"}</span>
+      }>
+        {f.authUser ? (
+          <div className="space-y-2 text-[11.5px] text-tx2 leading-relaxed">
+            <p>Data is persisted to Supabase tables scoped by <span className="font-mono text-[10.5px]">auth.uid()</span> with row-level security enforced in the database — not in app code.</p>
+            <button className="btn" onClick={() => void f.signOut()}>Sign out</button>
+          </div>
+        ) : supabaseConfigured ? (
+          <AccountForm />
+        ) : (
+          <p className="text-[11.5px] text-tx3 leading-relaxed">
+            This deployment has no <span className="font-mono">VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY</span>, so Forge runs in clearly labeled session-only mode.
+            Provide the env vars, apply <span className="font-mono">supabase/migrations/0001_core_schema.sql</span>, and sign-in unlocks persisted, RLS-protected storage. Nothing here silently pretends to save.
+          </p>
+        )}
+      </Panel>
+
+      {/* OAuth */}
+      <Panel title="OAuth connections — real flows via Edge Functions" right={<span className="chip">state + PKCE server-side</span>}>
+        <div className="space-y-2.5">
+          <OAuthRow provider="GitHub" status={f.integrations.github}
+            detail="read:user + repo scopes. Token exchange and storage happen in supabase/functions/github-oauth; tokens never reach this client."
+            connect={() => void f.connectGithubOAuth()} />
+          <OAuthRow provider="Google" status={f.integrations.google}
+            detail="Calendar + Gmail (read-only + compose). PKCE verifier held server-side; refresh and revocation handled by the function."
+            connect={() => void f.connectGoogleOAuth()}
+            revoke={f.integrations.google === "connected" ? () => void f.revokeGoogle() : undefined} />
+          {!supabaseConfigured && (
+            <p className="text-[10.5px] text-tx3 leading-relaxed border-t border-line pt-2">
+              BLOCKED BY CREDENTIALS: OAuth needs Supabase Edge Functions deployed with GITHUB_CLIENT_ID/SECRET and GOOGLE_CLIENT_ID/SECRET.
+              The full flow (prepare → authorize → state-validated callback → encrypted token storage → authenticated proxy) is implemented in <span className="font-mono">supabase/functions/*</span>; it has not been executed end-to-end in this environment.
+            </p>
+          )}
+        </div>
+      </Panel>
+
       {/* Integrations */}
       <Panel title="Integration adapters — honest status" className="xl:col-span-2">
         <div className="grid md:grid-cols-2 xl:grid-cols-4 gap-3">
-          <Adapter name="GitHub REST API" status={f.github?.live ? "connected (public)" : "ready"} tone={f.github?.live ? "ok" : "steel"}
-            detail="Live, unauthenticated public data. OAuth app needs GITHUB_CLIENT_ID/SECRET server-side." />
-          <Adapter name="Google Calendar" status="proposal mode" tone="warn"
-            detail="Proposals + confirm + external-ID sync logic implemented; live write needs GOOGLE_CLIENT_ID/SECRET + server token exchange." />
-          <Adapter name="Gmail" status="drafts only" tone="warn"
-            detail="Associate / draft / confirm implemented. Sending requires Gmail API scope via the same Google OAuth app." />
+          <Adapter name="GitHub" status={f.integrations.github === "connected" ? "oauth connected" : f.github?.live ? "public api live" : "ready"} tone={f.integrations.github === "connected" || f.github?.live ? "ok" : "steel"}
+            detail="Public analysis runs live in-browser. Full OAuth (private repos) is implemented in supabase/functions/github-oauth — needs GITHUB_CLIENT_ID/SECRET deployed." />
+          <Adapter name="Google Calendar" status={f.integrations.google === "connected" ? "connected" : "confirm-gated"} tone={f.integrations.google === "connected" ? "ok" : "warn"}
+            detail="Propose → explicit confirm → real events.insert via Edge Function, external IDs persisted, duplicates rejected pre-write. Needs GOOGLE_CLIENT_ID/SECRET deployed." />
+          <Adapter name="Gmail" status={f.integrations.google === "connected" ? "read + drafts" : "drafts only"} tone={f.integrations.google === "connected" ? "ok" : "warn"}
+            detail="Read-only + drafts.create behind the proxy. No send path exists anywhere in the codebase — structural, not configurable." />
           <Adapter name="Browser agent" status="adapter shell" tone="steel"
             detail="Field mapping + preview + hard stop before submit. Provider: Playwright or Browserbase via server worker." />
           <Adapter name="Source corpus" status="synthetic · labeled" tone="warn"
@@ -173,6 +214,52 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
       <span className="lbl block mb-1.5">{label}</span>
       {children}
     </label>
+  );
+}
+
+function AccountForm() {
+  const f = useForge();
+  const [email, setEmail] = useState("");
+  const [pw, setPw] = useState("");
+  const [mode, setMode] = useState<"in" | "up">("in");
+  const [busy, setBusy] = useState(false);
+  const go = async () => {
+    setBusy(true);
+    const ok = mode === "in" ? await f.signIn(email, pw) : await f.signUp(email, pw);
+    setBusy(false);
+    if (ok && mode === "in") f.toast("Signed in — loading your persisted data", "ok");
+  };
+  return (
+    <div className="space-y-2.5">
+      <div className="flex gap-2">
+        <button className={`chip cursor-pointer ${mode === "in" ? "text-ember border-ember/50" : ""}`} onClick={() => setMode("in")}>sign in</button>
+        <button className={`chip cursor-pointer ${mode === "up" ? "text-ember border-ember/50" : ""}`} onClick={() => setMode("up")}>create account</button>
+      </div>
+      <input className="input" type="email" placeholder="you@example.com" value={email} onChange={(e) => setEmail(e.target.value)} />
+      <input className="input" type="password" placeholder="password" value={pw} onChange={(e) => setPw(e.target.value)}
+        onKeyDown={(e) => e.key === "Enter" && email && pw && void go()} />
+      <button className="btn btn-ember" disabled={!email || !pw || busy} onClick={() => void go()}>
+        {busy ? "Working…" : mode === "in" ? "Sign in" : "Sign up"}
+      </button>
+    </div>
+  );
+}
+
+function OAuthRow({ provider, status, detail, connect, revoke }: {
+  provider: string; status: string; detail: string; connect: () => void; revoke?: () => void;
+}) {
+  const connected = status === "connected";
+  return (
+    <div className="panel !bg-panel2 p-3">
+      <div className="flex items-center gap-2 flex-wrap">
+        <span className="text-[12.5px] font-medium">{provider}</span>
+        <span className={`chip !text-[9px] ${connected ? "text-ok border-ok/40" : status === "revoked" ? "text-danger border-danger/40" : "text-tx3"}`}>{status}</span>
+        <span className="flex-1" />
+        {connected && revoke && <button className="btn !py-1 !text-[10px]" onClick={revoke}>Revoke</button>}
+        <button className="btn btn-ember !py-1 !text-[10px]" onClick={connect}>{connected ? "Reconnect" : `Connect ${provider}`}</button>
+      </div>
+      <p className="text-[10.5px] text-tx3 leading-relaxed mt-1.5">{detail}</p>
+    </div>
   );
 }
 

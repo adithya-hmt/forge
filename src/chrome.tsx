@@ -92,8 +92,16 @@ export function Sidebar({ mobileOpen, onClose }: { mobileOpen: boolean; onClose:
 
         <div className="border-t border-line p-3 space-y-2">
           <div className="flex items-center justify-between">
-            <span className="lbl">Corpus</span>
-            <span className="chip !text-[9px] text-warn border-warn/40">{SYNTHETIC ? "synthetic · labeled" : "live"}</span>
+            <span className="lbl">Sources</span>
+            <span className={`chip !text-[9px] ${f.sourceMode === "live" ? "text-ok border-ok/40" : "text-warn border-warn/40"}`}>
+              {f.sourceMode === "live" ? "live web" : "synthetic · labeled"}
+            </span>
+          </div>
+          <div className="flex items-center justify-between">
+            <span className="lbl">Storage</span>
+            <span className={`chip !text-[9px] ${f.persistenceKind === "supabase" ? "text-ok border-ok/40" : "text-warn border-warn/40"}`}>
+              {f.persistenceKind === "supabase" ? `supabase · RLS` : "session-only"}
+            </span>
           </div>
           <div className="flex items-center justify-between">
             <span className="lbl">Crawl epoch</span>

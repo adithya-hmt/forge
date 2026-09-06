@@ -80,7 +80,7 @@ export default function Workspace({ oppId }: { oppId: string }) {
         </div>
         <div className="flex justify-end gap-2">
           <button className="btn" onClick={() => setCalConfirm(false)}>Cancel</button>
-          <button className="btn btn-ember" onClick={() => { f.syncCalendar(active); setCalConfirm(false); }}><Icon name="check" size={12} /> Confirm & create events</button>
+          <button className="btn btn-ember" onClick={() => { void f.syncCalendar(active); setCalConfirm(false); }}><Icon name="check" size={12} /> Confirm & create events</button>
         </div>
       </Modal>
     </div>
@@ -190,7 +190,15 @@ function ApplicationTab({ oppId }: { oppId: string }) {
         </p>
         <div className="flex gap-2 mt-3">
           <button className="btn" onClick={() => f.setOutcome(oppId, "applied")}><Icon name="check" size={12} /> I submitted this myself</button>
-          <button className="btn btn-ghost" onClick={() => f.toast("Export is a local copy — the application itself must be submitted by you on the official page", "info")}>Export copy</button>
+          <button className="btn btn-ghost" onClick={() => {
+            const blob = new Blob([`${d.kind}\n\n${d.body}\n`], { type: "text/plain;charset=utf-8" });
+            const a = document.createElement("a");
+            a.href = URL.createObjectURL(blob);
+            a.download = `forge-${d.kind.toLowerCase().replace(/\W+/g, "-")}.txt`;
+            a.click();
+            URL.revokeObjectURL(a.href);
+            f.toast("Exported a local copy — the application itself must be submitted by you on the official page", "info");
+          }}>Export copy</button>
         </div>
       </Panel>
     </div>
@@ -221,7 +229,7 @@ function CalendarTab({ plan, oppId, onConfirm }: { plan: Plan; oppId: string; on
               </div>
             </div>
             {plan.calendarSynced
-              ? <span className="font-mono text-[9.5px] text-ok">{b.externalId}</span>
+              ? <span className={`font-mono text-[9.5px] ${b.externalId?.startsWith("local-") ? "text-warn" : "text-ok"}`}>{b.externalId}{b.externalId?.startsWith("local-") ? " (no external event)" : ""}</span>
               : <span className="chip !text-[9px] text-warn border-warn/40">proposal</span>}
           </div>
         );
@@ -241,7 +249,8 @@ function EmailTab({ oppId }: { oppId: string }) {
   const drafts = f.emailDrafts.filter((d) => d.oppId === oppId || !d.oppId);
   return (
     <div className="grid gap-4 xl:grid-cols-2 items-start">
-      <Panel title="Related messages (associated by opportunity match)" pad={false}>
+      <Panel title="Related messages (associated by opportunity match)" pad={false}
+        right={<button className="btn !py-1 !text-[10px]" onClick={() => void f.fetchGmail()}><Icon name="mail" size={11} /> Fetch from Gmail</button>}>
         {related.length === 0 && <div className="p-5 text-[12px] text-tx3">No related messages found for this opportunity.</div>}
         {related.map((m, i) => (
           <div key={m.id} className="px-4 py-3 border-b border-line/60 last:border-0 fade-up" style={{ ["--i" as string]: i }}>

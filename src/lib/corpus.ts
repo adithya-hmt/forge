@@ -34,7 +34,7 @@ function doc(partial: Omit<SourceDoc, "retrievedAt"> & { ageH?: number }): Sourc
 export function buildCorpus(epoch: number): SourceDoc[] {
   const docs: SourceDoc[] = [
     doc({
-      id: "doc-helios-official", provider: "official", ageH: 4,
+      id: "doc-helios-official", provider: "official", ageH: 4, org: "Meridian Labs",
       url: "https://helios.meridianlabs.example/2026",
       title: "Helios AI Hackathon 2026 — Meridian Labs",
       text: `HELIOS AI HACKATHON 2026
@@ -51,7 +51,7 @@ To apply: register a team, submit a GitHub repository and a demo video of 3 minu
 Competition: roughly 1,400 teams registered last edition.`,
     }),
     doc({
-      id: "doc-helios-hackboard", provider: "aggregator", ageH: 30,
+      id: "doc-helios-hackboard", provider: "aggregator", ageH: 30, org: "Meridian Labs",
       url: "https://hackboard.example/events/helios-ai-2026",
       title: "Helios AI Hackathon 2026 | Hackboard",
       text: `Helios AI Hackathon 2026 — listed on Hackboard
@@ -76,7 +76,7 @@ Application requires: CV, one repository you are proud of, and a 500-word propos
 Competition: about 300 applicants for 20 seats last cycle.`,
     }),
     doc({
-      id: "doc-northwind-official", provider: "official", ageH: 12, failFirst: true,
+      id: "doc-northwind-official", provider: "official", ageH: 12, failFirst: true, org: "Northwind Cloud",
       url: "https://careers.northwindcloud.example/intern-swe",
       title: "Software Engineering Intern — Northwind Cloud",
       text: `SOFTWARE ENGINEERING INTERN (REMOTE)
@@ -92,7 +92,7 @@ Application: resume, transcript, and one short coding exercise.
 Competition: medium — the team hires 8 interns from roughly 900 applicants.`,
     }),
     doc({
-      id: "doc-northwind-uni", provider: "university", ageH: 20,
+      id: "doc-northwind-uni", provider: "university", ageH: 20, org: "Northwind Cloud",
       url: "https://careers.westfield.example/listings/northwind-swe-intern",
       title: "Northwind Cloud — SWE Intern (via Westfield Career Center)",
       text: `Northwind Cloud is hiring Software Engineering Interns (remote, US/Canada).

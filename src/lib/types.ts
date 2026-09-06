@@ -17,11 +17,12 @@ export interface ProviderInfo {
 
 export interface SourceDoc {
   id: string;
-  provider: ProviderId;
+  provider: string;       // provider/adapter id; ProviderId constants are the synthetic set
   url: string;
   title: string;
   text: string;
   retrievedAt: number;
+  org?: string;           // organizer when the source page states it (dedupe signal)
   failFirst?: boolean;    // simulate transient fetch failure (retry path)
 }
 
@@ -32,7 +33,7 @@ export interface EvidenceRef {
   excerpt: string;
   retrievedAt: number;
   contentHash: string;
-  provider: ProviderId;
+  provider: string;
   confidence: number;
 }
 
@@ -271,6 +272,7 @@ export interface EmailMsg {
   oppId?: string;
   detectedDeadline?: number;
   synthetic: boolean;
+  externalId?: string;   // real Gmail message id when fetched via the server proxy
 }
 
 export interface EmailDraft {
